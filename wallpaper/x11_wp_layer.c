@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <jpeglib.h>
+#include <png.h>
 
 enum {
     EXIT_OK = 0,
@@ -21,7 +22,7 @@ enum {
 static volatile sig_atomic_t g_running = 1;
 
 static void print_usage(const char *program_name) {
-    fprintf(stderr, "Usage: %s <image.jpg> [--foreground]\n", program_name);
+    fprintf(stderr, "Usage: %s <image.(jpg|jpeg|png)> [--foreground]\n", program_name);
 }
 
 static void signal_handler(int signum) {
@@ -128,6 +129,185 @@ static unsigned char *read_jpeg_as_bgra(const char *filename, int *width, int *h
     return pixels;
 }
 
+static unsigned char *read_png_as_bgra(const char *filename, int *width, int *height) {
+    FILE *input_file = fopen(filename, "rb");
+    if (!input_file)
+        return NULL;
+
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png) {
+        fclose(input_file);
+        return NULL;
+    }
+
+    png_infop info = png_create_info_struct(png);
+    if (!info) {
+        png_destroy_read_struct(&png, NULL, NULL);
+        fclose(input_file);
+        return NULL;
+    }
+
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_read_struct(&png, &info, NULL);
+        fclose(input_file);
+        return NULL;
+    }
+
+    png_init_io(png, input_file);
+    png_read_info(png, info);
+
+    *width = (int)png_get_image_width(png, info);
+    *height = (int)png_get_image_height(png, info);
+    png_byte color_type = png_get_color_type(png, info);
+    png_byte bit_depth = png_get_bit_depth(png, info);
+
+    if (bit_depth == 16)
+        png_set_strip_16(png);
+    if (color_type == PNG_COLOR_TYPE_PALETTE)
+        png_set_palette_to_rgb(png);
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8)
+        png_set_expand_gray_1_2_4_to_8(png);
+    if (png_get_valid(png, info, PNG_INFO_tRNS))
+        png_set_tRNS_to_alpha(png);
+    if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
+        png_set_gray_to_rgb(png);
+    if (!(color_type & PNG_COLOR_MASK_ALPHA))
+        png_set_add_alpha(png, 0xff, PNG_FILLER_AFTER);
+
+    png_read_update_info(png, info);
+
+    size_t pixel_count = (size_t)(*width) * (size_t)(*height);
+    unsigned char *pixels = malloc(pixel_count * 4u);
+    png_bytep *rows = malloc((size_t)(*height) * sizeof(*rows));
+    if (!pixels || !rows) {
+        free(rows);
+        free(pixels);
+        png_destroy_read_struct(&png, &info, NULL);
+        fclose(input_file);
+        return NULL;
+    }
+
+    for (int y = 0; y < *height; ++y)
+        rows[y] = pixels + (size_t)y * (size_t)(*width) * 4u;
+
+    png_read_image(png, rows);
+    png_read_end(png, NULL);
+
+    for (size_t i = 0; i < pixel_count; ++i) {
+        unsigned char *pixel = pixels + i * 4u;
+        unsigned char red = pixel[0];
+        pixel[0] = pixel[2];
+        pixel[2] = red;
+        pixel[3] = 0;
+    }
+
+    free(rows);
+    png_destroy_read_struct(&png, &info, NULL);
+    fclose(input_file);
+    return pixels;
+}
+
+static const char *get_file_extension(const char *filename) {
+    const char *dot = strrchr(filename, '.');
+    return dot ? dot + 1 : NULL;
+}
+
+static bool extension_equals(const char *extension, const char *value) {
+    if (!extension || !value)
+        return false;
+
+    while (*extension && *value) {
+        char a = *extension;
+        char b = *value;
+        if (a >= 'A' && a <= 'Z')
+            a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z')
+            b = (char)(b - 'A' + 'a');
+        if (a != b)
+            return false;
+        ++extension;
+        ++value;
+    }
+
+    return *extension == '\0' && *value == '\0';
+}
+
+static unsigned char *read_image_as_bgra(const char *filename, int *width, int *height) {
+    const char *extension = get_file_extension(filename);
+
+    if (extension_equals(extension, "jpg") || extension_equals(extension, "jpeg"))
+        return read_jpeg_as_bgra(filename, width, height);
+    if (extension_equals(extension, "png"))
+        return read_png_as_bgra(filename, width, height);
+
+    return NULL;
+}
+
+static unsigned char *scale_bgra_cover(
+    const unsigned char *src_pixels,
+    int src_width,
+    int src_height,
+    int dst_width,
+    int dst_height) {
+    if (!src_pixels || src_width <= 0 || src_height <= 0 || dst_width <= 0 || dst_height <= 0)
+        return NULL;
+
+    size_t dst_pixel_count = (size_t)dst_width * (size_t)dst_height;
+    unsigned char *dst_pixels = malloc(dst_pixel_count * 4u);
+    if (!dst_pixels)
+        return NULL;
+
+    double scale_x = (double)dst_width / (double)src_width;
+    double scale_y = (double)dst_height / (double)src_height;
+    double scale = (scale_x > scale_y) ? scale_x : scale_y;
+
+    double sampled_width = (double)dst_width / scale;
+    double sampled_height = (double)dst_height / scale;
+    double offset_x = ((double)src_width - sampled_width) * 0.5;
+    double offset_y = ((double)src_height - sampled_height) * 0.5;
+
+    for (int y = 0; y < dst_height; ++y) {
+        double src_y = offset_y + ((double)y + 0.5) / scale - 0.5;
+        if (src_y < 0.0)
+            src_y = 0.0;
+        if (src_y > (double)(src_height - 1))
+            src_y = (double)(src_height - 1);
+
+        int y0 = (int)src_y;
+        int y1 = (y0 + 1 < src_height) ? (y0 + 1) : y0;
+        double wy = src_y - (double)y0;
+
+        for (int x = 0; x < dst_width; ++x) {
+            double src_x = offset_x + ((double)x + 0.5) / scale - 0.5;
+            if (src_x < 0.0)
+                src_x = 0.0;
+            if (src_x > (double)(src_width - 1))
+                src_x = (double)(src_width - 1);
+
+            int x0 = (int)src_x;
+            int x1 = (x0 + 1 < src_width) ? (x0 + 1) : x0;
+            double wx = src_x - (double)x0;
+
+            size_t src_index_00 = ((size_t)y0 * (size_t)src_width + (size_t)x0) * 4u;
+            size_t src_index_10 = ((size_t)y0 * (size_t)src_width + (size_t)x1) * 4u;
+            size_t src_index_01 = ((size_t)y1 * (size_t)src_width + (size_t)x0) * 4u;
+            size_t src_index_11 = ((size_t)y1 * (size_t)src_width + (size_t)x1) * 4u;
+            size_t dst_index = ((size_t)y * (size_t)dst_width + (size_t)x) * 4u;
+
+            for (int channel = 0; channel < 4; ++channel) {
+                double top = (double)src_pixels[src_index_00 + (size_t)channel] * (1.0 - wx) +
+                             (double)src_pixels[src_index_10 + (size_t)channel] * wx;
+                double bottom = (double)src_pixels[src_index_01 + (size_t)channel] * (1.0 - wx) +
+                                (double)src_pixels[src_index_11 + (size_t)channel] * wx;
+                double value = top * (1.0 - wy) + bottom * wy;
+                dst_pixels[dst_index + (size_t)channel] = (unsigned char)(value + 0.5);
+            }
+        }
+    }
+
+    return dst_pixels;
+}
+
 static int create_desktop_wallpaper_window(
     Display *display,
     int screen,
@@ -137,10 +317,22 @@ static int create_desktop_wallpaper_window(
     XImage **out_image,
     unsigned char **out_pixels) {
     Window root = RootWindow(display, screen);
+    int screen_width = DisplayWidth(display, screen);
+    int screen_height = DisplayHeight(display, screen);
 
     int image_width = 0;
     int image_height = 0;
-    unsigned char *pixels = read_jpeg_as_bgra(image_path, &image_width, &image_height);
+    unsigned char *source_pixels = read_image_as_bgra(image_path, &image_width, &image_height);
+    if (!source_pixels)
+        return -1;
+
+    unsigned char *pixels = scale_bgra_cover(
+        source_pixels,
+        image_width,
+        image_height,
+        screen_width,
+        screen_height);
+    free(source_pixels);
     if (!pixels)
         return -1;
 
@@ -151,8 +343,8 @@ static int create_desktop_wallpaper_window(
         ZPixmap,
         0,
         (char *)pixels,
-        image_width,
-        image_height,
+        screen_width,
+        screen_height,
         32,
         0);
     if (!image) {
@@ -163,8 +355,8 @@ static int create_desktop_wallpaper_window(
     Pixmap pixmap = XCreatePixmap(
         display,
         root,
-        (unsigned int)image_width,
-        (unsigned int)image_height,
+        (unsigned int)screen_width,
+        (unsigned int)screen_height,
         DefaultDepth(display, screen));
     if (!pixmap) {
         image->data = NULL;
@@ -174,15 +366,12 @@ static int create_desktop_wallpaper_window(
     }
 
     XPutImage(display, pixmap, DefaultGC(display, screen), image,
-              0, 0, 0, 0, (unsigned int)image_width, (unsigned int)image_height);
+              0, 0, 0, 0, (unsigned int)screen_width, (unsigned int)screen_height);
 
     XSetWindowAttributes attrs;
     memset(&attrs, 0, sizeof(attrs));
     attrs.background_pixmap = pixmap;
     attrs.override_redirect = False;
-
-    int screen_width = DisplayWidth(display, screen);
-    int screen_height = DisplayHeight(display, screen);
 
     Window desktop_window = XCreateWindow(
         display,
